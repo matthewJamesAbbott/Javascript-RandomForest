@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Random Forest Trainer and Evaluator</title>
+    <style>
+        body { font-family: Arial,sans-serif; margin:2rem; }
+        .section { margin-bottom:2rem; border-bottom:1px solid #ccc; padding-bottom:1rem; }
+        label { display: block; margin-top:0.5rem; }
+        .results { background-color:#f5f5f5; padding:1rem; margin:1rem 0; border-radius:5px; }
+        table { border-collapse: collapse; width:100%; margin: 1rem 0;}
+        th,td { border: 1px solid #ddd; padding:8px;text-align:left;}
+        th { background-color: #f2f2f2; }
+        .metric { font-weight:bold; margin-right:1rem;}
+    </style>
+</head>
+<body>
+<h1>Random Forest Trainer and Evaluator</h1>
+
+<div class="section">
+    <h2>Random Forest Configuration</h2>
+    <label># Trees: <input type="number" id="numTrees" value="100" min="1" max="500"></label>
+    <label>Max Depth: <input type="number" id="maxDepth" value="10" min="1"></label>
+    <label>Min Samples Leaf: <input type="number" id="minSamplesLeaf" value="1" min="1"></label>
+    <label>Min Samples Split: <input type="number" id="minSamplesSplit" value="2" min="2"></label>
+    <label>Max Features (<span id="maxFeaturesAuto">auto</span>): <input type="number" id="maxFeatures" value="0" min="0" max="100"></label>
+    <label>Task Type:
+        <select id="taskType">
+            <option value="classification" selected>Classification</option>
+            <option value="regression">Regression</option>
+        </select>
+    </label>
+    <label>Split Criterion:
+        <select id="criterion">
+            <option value="gini" selected>Gini</option>
+            <option value="entropy">Entropy</option>
+            <option value="mse">MSE</option>
+            <option value="variance">Variance Reduction</option>
+        </select>
+    </label>
+    <button onclick="createForest()">Create Forest</button>
+    <span id="forestStatus" style="margin-left:1rem;"></span>
+</div>
+
+<div class="section">
+    <h2>Data Input / Generation</h2>
+    <label>Input Features: <input type="number" id="inputFeatures" value="10" min="1" max="100"></label>
+    <label>Output Classes: <input type="number" id="outputClasses" value="3" min="1" max="10"></label>
+    <label># Samples per Class: <input type="number" id="samplesPerClass" value="250" min="10" max="1000"></label>
+    <button onclick="generateSyntheticData()">Generate Synthetic Data</button>
+    <br>
+    <input type="file" id="csvFile" accept=".csv">
+    <button onclick="loadCSV()">Load CSV</button>
+    <span id="dataStatus"></span>
+    <br>
+    <label>Or paste CSV:</label>
+    <textarea id="csvPaste" rows="5" cols="60"></textarea>
+    <button onclick="loadCSVText()">Load pasted CSV</button>
+    <label><input type="checkbox" id="normalizeData" checked> Normalize features to [0,1]</label>
+    <div id="dataPreview"></div>
+</div>
+
+<div class="section">
+    <h2>Training</h2>
+    <button onclick="trainForest()">Train Forest</button>
+    <span id="trainStatus"></span>
+    <div id="forestInfo"></div>
+</div>
+
+<div class="section">
+    <h2>Model Evaluation</h2>
+    <button onclick="showOOBError()">OOB Error</button>
+    <button onclick="showFeatureImportances()">Feature Importances</button>
+    <div id="evalResults"></div>
+</div>
+
+<div class="section">
+    <h2>Predict</h2>
+    <label>Input (comma separated): <input type="text" id="predictInput" value="0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,0"></label>
+    <button onclick="predictInput()">Predict</button>
+    <div id="predictOutput"></div>
+</div>
+
+<script>
+// --- RandomForest Class (Pascal logic ported to JS) ---
+class RandomForest {
+    static MAX_FEATURES = 100;
+    static MAX_SAMPLES = 10000;
+    static MAX_TREES = 500;
+    constructor() {
+        this.numTrees = 100;
+        this.maxDepth = 10;
+        this.minSamplesLeaf = 1;
+        this.minSamplesSplit = 2;
+        this.maxFeatures = 0;
+        this.numFeatures = 0;
+        this.numSamples = 0;
+        this.taskType = "classification";
+        this.criterion = "gini";
+        this.randomSeed = 42;
+        this.trees = [];
+        this.featureImportances = Array(RandomForest.MAX_FEATURES).fill(0);
+        this.data = [];
+        this.targets = [];
+    }
+    setNumTrees(n) { this.numTrees = Math.max(1, Math.min(RandomForest.MAX_TREES, n)); }
+    setMaxDepth(d) { this.maxDepth = Math.max(1, d); }
+    setMinSamplesLeaf(m) { this.minSamplesLeaf = Math.max(1, m); }
+    setMinSamplesSplit(m) { this.minSamplesSplit = Math.max(2, m); }
+    setMaxFeatures(m) { this.maxFeatures = m; }
+    setTaskType(t) {
+        this.taskType = t;
+        this.criterion = t === "classification" ? "gini" : "mse";
+    }
+    setCriterion(c) { this.criterion = c; }
+    setRandomSeed(seed) {
+        this.randomSeed = seed;
+        // TODO: seedable random. Default is Math.random()
+    }
+    loadData(inputData, inputTargets, nSamples, nFeatures) {
+        this.data = inputData.slice();
+        this.targets = inputTargets.slice();
+        this.numSamples = nSamples;
+        this.numFeatures = nFeatures;
+        if (!this.maxFeatures || this.maxFeatures <= 0) {
+            this.maxFeatures = this.taskType === "classification"
+                ? Math.round(Math.sqrt(this.numFeatures))
+                : Math.floor(this.numFeatures / 3);
+            if (this.maxFeatures < 1) this.maxFeatures = 1;
+        }
+    }
+    randomInt(maxVal) { return Math.floor(Math.random() * maxVal); }
+    randomDouble() { return Math.random(); }
+    selectFeatureSubset() {
+        // Randomly select maxFeatures from all features
+        let indices = Array.from({length: this.numFeatures}, (_, i) => i);
+        for (let i = this.numFeatures - 1; i > 0; i--) {
+            let j = this.randomInt(i+1);
+            [indices[i],indices[j]] = [indices[j],indices[i]];
+        }
+        return indices.slice(0, Math.min(this.maxFeatures,this.numFeatures));
+    }
+    bootstrapSample() {
+        // Returns bootstrapped sample indices and OOB mask
+        let indices = [];
+        let oobMask = Array(this.numSamples).fill(true);
+        for (let i=0; i<this.numSamples; ++i) {
+            let idx = this.randomInt(this.numSamples);
+            indices.push(idx);
+            oobMask[idx] = false;
+        }
+        return {sampleIndices:indices, oobMask:oobMask};
+    }
+    fit() {
+        this.trees = [];
+        this.featureImportances.fill(0);
+        for (let t=0; t<this.numTrees; ++t) {
+            this.trees.push(this.buildTreeWrapper());
+        }
+        this.calculateFeatureImportances();
+    }
+    buildTreeWrapper() {
+        let {sampleIndices, oobMask} = this.bootstrapSample();
+        return {
+            root: this.buildTree(sampleIndices,0),
+            oobMask: oobMask
+        };
+    }
+    buildTree(indices, depth) {
+        // If stopping conditions, return leaf
+        const impurity = this.calculateImpurity(indices);
+        if (this.shouldStop(depth, indices.length, impurity))
+            return this.createLeafNode(indices);
+        const featureIndices = this.selectFeatureSubset();
+        const split = this.findBestSplit(indices, featureIndices);
+        if (!split)
+            return this.createLeafNode(indices);
+        const {bestFeature, bestThreshold, leftIndices, rightIndices} = split;
+        // Update feature importances
+        this.featureImportances[bestFeature] += 
+            indices.length * impurity
+            - leftIndices.length * this.calculateImpurity(leftIndices)
+            - rightIndices.length * this.calculateImpurity(rightIndices);
+        // Build subtrees
+        return {
+            isLeaf:false,
+            featureIndex: bestFeature,
+            threshold: bestThreshold,
+            impurity: impurity,
+            left: this.buildTree(leftIndices,depth+1),
+            right: this.buildTree(rightIndices,depth+1)
+        };
+    }
+    shouldStop(depth, numIndices, impurity) {
+        return depth >= this.maxDepth
+            || numIndices < this.minSamplesSplit
+            || numIndices <= this.minSamplesLeaf
+            || impurity < 1e-10;
+    }
+    createLeafNode(indices) {
+        if (this.taskType === "classification") {
+            // Majority class
+            let counts = {};
+            indices.forEach(idx=> {
+                let cls = Math.round(this.targets[idx]);
+                counts[cls] = (counts[cls]||0)+1;
+            });
+            let maxClass = Object.keys(counts).reduce((a,b)=>counts[a]>counts[b]?a:b);
+            return {isLeaf:true, prediction:parseInt(maxClass), classLabel:parseInt(maxClass)};
+        } else {
+            // Regression: mean
+            let sum = indices.reduce((acc,idx)=>acc+this.targets[idx],0);
+            let mean = sum/(indices.length||1);
+            return {isLeaf:true, prediction:mean, classLabel:Math.round(mean)};
+        }
+    }
+    findBestSplit(indices, featureIndices) {
+        let bestGain = 0, bestFeature = -1, bestThreshold = null;
+        let leftBest=[], rightBest=[];
+        let parentImpurity = this.calculateImpurity(indices);
+        for (let f of featureIndices) {
+            // Gather and sort feature values
+            let values = indices.map(idx=>this.data[idx][f]);
+            let sorted = Array.from(indices.keys()).sort((a,b)=>values[a]-values[b]);
+            for (let i=0; i<sorted.length-1; ++i) {
+                if (values[sorted[i]] === values[sorted[i+1]]) continue;
+                let threshold = (values[sorted[i]] + values[sorted[i+1]])/2;
+                let left = indices.filter(idx=>this.data[idx][f]<=threshold);
+                let right = indices.filter(idx=>this.data[idx][f]>threshold);
+                if (left.length < this.minSamplesLeaf || right.length < this.minSamplesLeaf) continue;
+                let leftImp = this.calculateImpurity(left);
+                let rightImp = this.calculateImpurity(right);
+                let gain = parentImpurity 
+                    - (left.length/indices.length)*leftImp
+                    - (right.length/indices.length)*rightImp;
+                if (gain > bestGain) {
+                    bestGain = gain;
+                    bestFeature = f;
+                    bestThreshold = threshold;
+                    leftBest = left;
+                    rightBest = right;
+                }
+            }
+        }
+        if (bestFeature === -1) return null;
+        return {bestFeature, bestThreshold, leftIndices:leftBest, rightIndices:rightBest};
+    }
+    calculateImpurity(indices) {
+        switch(this.criterion) {
+            case "gini": return this.calculateGini(indices);
+            case "entropy": return this.calculateEntropy(indices);
+            case "mse": return this.calculateMSE(indices);
+            case "variance": return this.calculateVariance(indices);
+            default: return this.calculateGini(indices);
+        }
+    }
+    calculateGini(indices) {
+        if (!indices.length) return 0;
+        let counts = {};
+        indices.forEach(idx=>{
+            let cls = Math.round(this.targets[idx]);
+            counts[cls] = (counts[cls]||0)+1;
+        });
+        let gini = 1;
+        let total = indices.length;
+        for (let key in counts) {
+            let prob = counts[key]/total;
+            gini -= prob*prob;
+        }
+        return gini;
+    }
+    calculateEntropy(indices) {
+        if (!indices.length) return 0;
+        let counts = {};
+        indices.forEach(idx=>{
+            let cls = Math.round(this.targets[idx]);
+            counts[cls] = (counts[cls]||0)+1;
+        });
+        let ent = 0;
+        let total = indices.length;
+        for (let key in counts) {
+            let prob = counts[key]/total;
+            if (prob>0)
+                ent -= prob*Math.log2(prob);
+        }
+        return ent;
+    }
+    calculateMSE(indices) {
+        if (!indices.length) return 0;
+        let mean = indices.reduce((acc,idx)=>acc+this.targets[idx],0)/indices.length;
+        let mse = indices.reduce((acc,idx)=>acc+Math.pow(this.targets[idx]-mean,2),0)/indices.length;
+        return mse;
+    }
+    calculateVariance(indices) {
+        return this.calculateMSE(indices);
+    }
+    predict(sample) {
+        if (this.taskType==="regression") {
+            let preds = this.trees.map(tree=>this.predictTree(tree.root,sample));
+            return preds.reduce((a,b)=>a+b,0)/(preds.length||1);
+        } else {
+            let votes = {};
+            this.trees.forEach(tree=>{
+                let label = Math.round(this.predictTree(tree.root,sample));
+                votes[label] = (votes[label]||0)+1;
+            });
+            // Majority vote
+            return Number(Object.keys(votes).reduce((a,b)=>votes[a]>votes[b]?a:b));
+        }
+    }
+    predictTree(node, sample) {
+        if (!node) return 0;
+        if (node.isLeaf) return node.prediction;
+        if (sample[node.featureIndex] <= node.threshold)
+            return this.predictTree(node.left,sample);
+        else
+            return this.predictTree(node.right,sample);
+    }
+    predictBatch(samples) {
+        return samples.map(sample=>this.predict(sample));
+    }
+    calculateOOBError() {
+        // Predict only for OOB samples
+        let error = 0, count = 0;
+        let isClassif = this.taskType === "classification";
+        for (let i=0; i<this.numSamples; ++i) {
+            let votes = {};
+            let sum=0, nOob=0;
+            this.trees.forEach(tree=>{
+                if (tree.oobMask[i]) {
+                    let pred = this.predictTree(tree.root,this.data[i]);
+                    if (isClassif) {
+                        let label = Math.round(pred);
+                        votes[label] = (votes[label]||0)+1;
+                    } else {
+                        sum += pred; 
+                    }
+                    nOob++;
+                }
+            });
+            if (nOob>0) {
+                if (isClassif) {
+                    let predClass = Number(Object.keys(votes).reduce((a,b)=>votes[a]>votes[b]?a:b,0));
+                    if (predClass !== Math.round(this.targets[i])) error++;
+                } else {
+                    let predVal = sum/nOob;
+                    error += Math.pow(predVal-this.targets[i],2);
+                }
+                count++;
+            }
+        }
+        return count>0 ? error/count : 0;
+    }
+    calculateFeatureImportances() {
+        // Normalize
+        let sum = this.featureImportances.reduce((a,b)=>a+b,0);
+        if (sum>0)
+            this.featureImportances = this.featureImportances.map(f=>f/sum);
+        else
+            this.featureImportances = this.featureImportances.map(_=>0);
+    }
+    getFeatureImportances() {
+        return this.featureImportances.slice(0,this.numFeatures);
+    }
+    getTree(treeId) { return this.trees[treeId]; }
+    getNumFeatures() { return this.numFeatures; }
+    getNumTrees() { return this.trees.length; }
+    getNumSamples() { return this.numSamples; }
+}
+
+// ---- UI/Controller Functions ----
+let forest = new RandomForest();
+let inputData = [], inputTargets = [];
+let generatedSamples = 0;
+
+function createForest() {
+    forest = new RandomForest();
+    forest.setNumTrees(Number(document.getElementById("numTrees").value));
+    forest.setMaxDepth(Number(document.getElementById("maxDepth").value));
+    forest.setMinSamplesLeaf(Number(document.getElementById("minSamplesLeaf").value));
+    forest.setMinSamplesSplit(Number(document.getElementById("minSamplesSplit").value));
+    forest.setMaxFeatures(Number(document.getElementById("maxFeatures").value));
+    forest.setTaskType(document.getElementById("taskType").value);
+    forest.setCriterion(document.getElementById("criterion").value);
+    forest.setRandomSeed(42);
+    document.getElementById("forestStatus").textContent = "Forest object created. Configure data and train.";
+}
+
+function generateSyntheticData() {
+    let numFeatures = Number(document.getElementById("inputFeatures").value);
+    let numClasses = Number(document.getElementById("outputClasses").value);
+    let samplesPerClass = Number(document.getElementById("samplesPerClass").value);
+    inputData = [];
+    inputTargets = [];
+    for (let cls=0; cls<numClasses; ++cls) {
+        for (let i=0; i<samplesPerClass; ++i) {
+            let features = [];
+            for (let j=0; j<numFeatures; ++j) {
+                // Simple: different means for each class
+                features.push(cls + Math.random()*0.5 + j*0.01);
+            }
+            inputData.push(features);
+            inputTargets.push(cls);
+        }
+    }
+    generatedSamples = numClasses*samplesPerClass;
+    if (document.getElementById("normalizeData").checked) normalizeData();
+    previewData(inputData, inputTargets,numFeatures);
+    document.getElementById("dataStatus").textContent = "Synthetic data generated";
+}
+
+function previewData(data, targets,numFeatures) {
+    let s = "<table><tr><th>Idx</th>";
+    for (let i=0;i<numFeatures;i++)s+="<th>X"+i+"</th>";
+    s+="<th>Y</th></tr>";
+    for (let i=0;i<Math.min(10,data.length);i++) {
+        s+="<tr><td>"+i+"</td>";
+        for (let j=0;j<numFeatures;j++) s+="<td>"+data[i][j].toFixed(3)+"</td>";
+        s+="<td>"+targets[i]+"</td></tr>";
+    }
+    s+="</table>";
+    document.getElementById("dataPreview").innerHTML = s;
+}
+
+function normalizeData() {
+    let mins = Array(inputData[0].length).fill(Infinity);
+    let maxs = Array(inputData[0].length).fill(-Infinity);
+    for (let i=0; i<inputData.length; ++i) {
+        for (let j=0;j<inputData[i].length;j++) {
+            if (inputData[i][j]<mins[j]) mins[j]=inputData[i][j];
+            if (inputData[i][j]>maxs[j]) maxs[j]=inputData[i][j];
+        }
+    }
+    inputData = inputData.map(row=>row.map((val,idx)=>{
+        let range=maxs[idx]-mins[idx];
+        return range===0 ? 0.5 : (val-mins[idx])/(range||1);
+    }));
+}
+
+function trainForest() {
+    let nSamples = inputData.length;
+    let nFeatures = inputData[0].length;
+    forest.loadData(inputData, inputTargets, nSamples, nFeatures);
+    forest.fit();
+    document.getElementById("trainStatus").textContent = "Forest trained. Trees: "+forest.getNumTrees();
+    showForestInfo();
+}
+
+function showForestInfo() {
+    let s = `<div class="results"><span class="metric">Num Trees:</span> ${forest.getNumTrees()} 
+        <span class="metric">Features:</span> ${forest.getNumFeatures()}
+        <span class="metric">Samples:</span> ${forest.getNumSamples()}
+        <span class="metric">Task:</span> ${forest.taskType}
+        <span class="metric">Criterion:</span> ${forest.criterion}
+        </div>`;
+    document.getElementById("forestInfo").innerHTML = s;
+}
+
+function showOOBError() {
+    let err = forest.calculateOOBError();
+    let out;
+    if (forest.taskType==="regression")
+        out = `OOB Mean Squared Error: <b>${err.toFixed(4)}</b>`;
+    else
+        out = `OOB Error Rate: <b>${err.toFixed(4)}</b>`;
+    document.getElementById("evalResults").innerHTML = out;
+}
+
+function showFeatureImportances() {
+    let imps = forest.getFeatureImportances();
+    let out = "<table><tr><th>Feature</th><th>Importance</th></tr>";
+    for (let i=0;i<imps.length;i++)
+        out+=`<tr><td>X${i}</td><td>${imps[i].toFixed(4)}</td></tr>`;
+    out+="</table>";
+    document.getElementById("evalResults").innerHTML = out;
+}
+
+function predictInput() {
+    let val = document.getElementById("predictInput").value;
+    let arr = val.split(',').map(Number);
+    if (arr.length !== forest.getNumFeatures()) {
+        document.getElementById("predictOutput").textContent = 'Error: Input vector size mismatch!';
+        return;
+    }
+    let pred = forest.predict(arr);
+    document.getElementById("predictOutput").textContent = 'Prediction: '+pred;
+}
+
+function loadCSV() {
+    let file = document.getElementById('csvFile').files[0];
+    if (!file) return;
+    let reader=new FileReader();
+    reader.onload=function(e){
+        parseCSV(e.target.result.trim());
+    };
+    reader.readAsText(file);
+}
+function loadCSVText() {
+    let txt = document.getElementById('csvPaste').value.trim();
+    parseCSV(txt);
+}
+function parseCSV(raw) {
+    let rows = raw.split('\n').map(r=>r.split(',').map(Number));
+    inputData = rows.map(r=>r.slice(0,-1));
+    inputTargets = rows.map(r=>r.slice(-1)[0]);
+    if (document.getElementById("normalizeData").checked) normalizeData();
+    previewData(inputData, inputTargets, inputData[0]?.length || 0);
+    document.getElementById("dataStatus").textContent = rows.length+" rows loaded";
+}
+
+</script>
+</body>
+</html>
