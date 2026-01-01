@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Random Forest Trainer and Evaluator</title>
+    <title>Random Forest</title>
     <style>
         body { font-family: Arial,sans-serif; margin:2rem; }
         .section { margin-bottom:2rem; border-bottom:1px solid #ccc; padding-bottom:1rem; }
@@ -15,7 +15,7 @@
     </style>
 </head>
 <body>
-<h1>Random Forest Trainer and Evaluator</h1>
+<h1>Random Forest</h1>
 
 <div class="section">
     <h2>Random Forest Configuration</h2>
@@ -61,11 +61,18 @@
 </div>
 
 <div class="section">
-    <h2>Training</h2>
-    <button onclick="trainForest()">Train Forest</button>
-    <span id="trainStatus"></span>
-    <div id="forestInfo"></div>
+    <h2>Save/Load Forest</h2>
+    <button onclick="saveNetwork()">Save Forest (.json)</button>
+    <button onclick="loadNetwork()">Load Forest (.json)</button>
+    <span id="loadStatus" style="margin-left:1rem;"></span>
 </div>
+
+ <div class="section">
+     <h2>Training</h2>
+     <button onclick="trainForest()">Train Forest</button>
+     <span id="trainStatus"></span>
+     <div id="forestInfo"></div>
+ </div>
 
 <div class="section">
     <h2>Model Evaluation</h2>
@@ -295,27 +302,45 @@ class RandomForest {
         return this.calculateMSE(indices);
     }
     predict(sample) {
-        if (this.taskType==="regression") {
-            let preds = this.trees.map(tree=>this.predictTree(tree.root,sample));
-            return preds.reduce((a,b)=>a+b,0)/(preds.length||1);
-        } else {
-            let votes = {};
-            this.trees.forEach(tree=>{
-                let label = Math.round(this.predictTree(tree.root,sample));
-                votes[label] = (votes[label]||0)+1;
-            });
-            // Majority vote
-            return Number(Object.keys(votes).reduce((a,b)=>votes[a]>votes[b]?a:b));
-        }
-    }
+         // Filter out null trees and check if we have any trained trees
+         let trainedTrees = this.trees.filter(t => t && t.root);
+         if (trainedTrees.length === 0) {
+             throw new Error("No trained trees available. Forest must be trained first.");
+         }
+         
+         if (this.taskType==="regression") {
+             let preds = trainedTrees.map(tree=>this.predictTree(tree.root,sample));
+             return preds.reduce((a,b)=>a+b,0)/(preds.length||1);
+         } else {
+             let votes = {};
+             trainedTrees.forEach(tree=>{
+                 let label = Math.round(this.predictTree(tree.root,sample));
+                 votes[label] = (votes[label]||0)+1;
+             });
+             // Majority vote
+             return Number(Object.keys(votes).reduce((a,b)=>votes[a]>votes[b]?a:b));
+         }
+     }
     predictTree(node, sample) {
-        if (!node) return 0;
-        if (node.isLeaf) return node.prediction;
-        if (sample[node.featureIndex] <= node.threshold)
-            return this.predictTree(node.left,sample);
-        else
-            return this.predictTree(node.right,sample);
-    }
+         if (!node) return 0;
+         // Leaf node: has prediction and classLabel, no featureIndex/threshold
+         if (node.isLeaf === true) {
+             return node.prediction || 0;
+         }
+         // Internal node: should have featureIndex and threshold
+         if (node.featureIndex === undefined || node.threshold === undefined) {
+             return 0;  // Malformed node
+         }
+         if (node.featureIndex >= sample.length) {
+             return 0;  // Feature index out of bounds
+         }
+         // Traverse tree
+         if (sample[node.featureIndex] <= node.threshold) {
+             return this.predictTree(node.left, sample);
+         } else {
+             return this.predictTree(node.right, sample);
+         }
+     }
     predictBatch(samples) {
         return samples.map(sample=>this.predict(sample));
     }
@@ -366,7 +391,68 @@ class RandomForest {
     getNumFeatures() { return this.numFeatures; }
     getNumTrees() { return this.trees.length; }
     getNumSamples() { return this.numSamples; }
-}
+    
+    toJSON() {
+         // Only include feature_importances if model was trained and has features
+         const payload = {
+             num_trees: this.numTrees,
+             max_depth: this.maxDepth,
+             min_samples_leaf: this.minSamplesLeaf,
+             min_samples_split: this.minSamplesSplit,
+             max_features: this.maxFeatures,
+             num_features: this.numFeatures,
+             num_samples: this.numSamples,
+             task_type: this.taskType,
+             criterion: this.criterion,
+             random_seed: this.randomSeed,
+             trees: this.trees.map(tree => tree ? tree.root : null)
+         };
+         // Only add feature importances if they were actually calculated (non-zero)
+         const hasImportances = this.featureImportances.slice(0, this.numFeatures).some(x => x !== 0);
+         if (hasImportances) {
+             payload.feature_importances = this.featureImportances.slice(0, this.numFeatures);
+         }
+         // Use compact format to match Pascal/binary saves for better file size
+         return JSON.stringify(payload);
+     }
+    
+    static fromJSON(jsonStr) {
+         try {
+             const data = JSON.parse(jsonStr);
+             const rf = new RandomForest();
+             rf.numTrees = data.num_trees || 100;
+             rf.maxDepth = data.max_depth || 10;
+             rf.minSamplesLeaf = data.min_samples_leaf || 1;
+             rf.minSamplesSplit = data.min_samples_split || 2;
+             rf.maxFeatures = data.max_features || 0;
+             rf.numFeatures = data.num_features || 0;
+             rf.numSamples = data.num_samples || 0;
+             rf.taskType = data.task_type || 'classification';
+             rf.criterion = data.criterion || 'gini';
+             rf.randomSeed = data.random_seed || 42;
+             if (data.feature_importances && Array.isArray(data.feature_importances)) {
+                 for (let i = 0; i < data.feature_importances.length; i++) {
+                     rf.featureImportances[i] = data.feature_importances[i];
+                 }
+             }
+             // Load trees if present
+             if (data.trees && Array.isArray(data.trees)) {
+                 rf.trees = [];
+                 for (let i = 0; i < data.trees.length; i++) {
+                     if (data.trees[i] !== null) {
+                         rf.trees.push({root: data.trees[i], oobMask: []});
+                     } else {
+                         rf.trees.push({root: null, oobMask: []});
+                     }
+                 }
+             }
+             return rf;
+         } catch (err) {
+             console.error('Error parsing JSON:', err);
+             return null;
+         }
+     }
+    }
 
 // ---- UI/Controller Functions ----
 let forest = new RandomForest();
@@ -476,15 +562,93 @@ function showFeatureImportances() {
 }
 
 function predictInput() {
-    let val = document.getElementById("predictInput").value;
-    let arr = val.split(',').map(Number);
-    if (arr.length !== forest.getNumFeatures()) {
-        document.getElementById("predictOutput").textContent = 'Error: Input vector size mismatch!';
-        return;
-    }
-    let pred = forest.predict(arr);
-    document.getElementById("predictOutput").textContent = 'Prediction: '+pred;
-}
+     let val = document.getElementById("predictInput").value;
+     let arr = val.split(',').map(Number);
+     // If numFeatures is 0 (metadata-only model), skip validation
+     // Otherwise, validate against numFeatures
+     if (forest.getNumFeatures() > 0 && arr.length !== forest.getNumFeatures()) {
+         document.getElementById("predictOutput").textContent = 'Error: Input vector size mismatch!';
+         return;
+     }
+     try {
+         let pred = forest.predict(arr);
+         document.getElementById("predictOutput").textContent = 'Prediction: '+pred;
+     } catch (err) {
+         document.getElementById("predictOutput").textContent = 'Error: ' + err.message;
+     }
+ }
+
+ function saveNetwork() {
+     if (!forest) return alert("Create a forest first.");
+     const blob = new Blob([forest.toJSON()], {type: "application/json"});
+     const a = document.createElement("a");
+     a.href = URL.createObjectURL(blob);
+     a.download = "forest-model.json";
+     a.click();
+     document.getElementById('forestStatus').textContent = "Forest saved.";
+ }
+
+ function loadNetwork() {
+     if (!document.getElementById('modelFile')) {
+         const fileInput = document.createElement('input');
+         fileInput.type = 'file';
+         fileInput.id = 'modelFile';
+         fileInput.accept = '.json';
+         fileInput.style.display = 'none';
+         document.body.appendChild(fileInput);
+     }
+     
+     document.getElementById('modelFile').onchange = function(evt) {
+         const file = evt.target.files[0];
+         if (!file) {
+             console.log("No file selected");
+             document.getElementById('loadStatus').textContent = "No file selected";
+             return;
+         }
+         console.log("Loading file:", file.name, "Size:", file.size);
+         document.getElementById('loadStatus').textContent = "Loading...";
+         const reader = new FileReader();
+         reader.onload = function(e) {
+             try {
+                 console.log("File content length:", e.target.result.length);
+                 forest = RandomForest.fromJSON(e.target.result);
+                 if (!forest) {
+                     document.getElementById('loadStatus').textContent = "Error: Failed to parse model";
+                     console.error("fromJSON returned null");
+                     return;
+                 }
+                 
+                 // Count trained vs untrained trees
+                 let trainedTrees = 0;
+                 if (forest.trees && forest.trees.length > 0) {
+                     trainedTrees = forest.trees.filter(t => t && t.root !== null).length;
+                 }
+                 
+                 let statusMsg = `✓ Forest loaded! Trees: ${forest.getNumTrees()} (${trainedTrees} trained), Features: ${forest.getNumFeatures()}, Samples: ${forest.getNumSamples()}, Task: ${forest.taskType}, Criterion: ${forest.criterion}`;
+                 document.getElementById('loadStatus').textContent = statusMsg;
+                 document.getElementById("taskType").value = forest.taskType;
+                 document.getElementById("criterion").value = forest.criterion;
+                 console.log("Forest loaded successfully", {
+                     numTrees: forest.getNumTrees(),
+                     trainedTrees: trainedTrees,
+                     numFeatures: forest.getNumFeatures(),
+                     numSamples: forest.getNumSamples(),
+                     taskType: forest.taskType,
+                     criterion: forest.criterion
+                 });
+             } catch (err) {
+                 document.getElementById('loadStatus').textContent = "Error: " + err.message;
+                 console.error("Load error:", err);
+             }
+         };
+         reader.onerror = function(err) {
+             document.getElementById('loadStatus').textContent = "Error reading file: " + err;
+             console.error("File read error:", err);
+         };
+         reader.readAsText(file);
+     };
+     document.getElementById('modelFile').click();
+ }
 
 function loadCSV() {
     let file = document.getElementById('csvFile').files[0];
